@@ -85,7 +85,7 @@ int run(int argc, char* argv[]) {
         throw std::runtime_error("No JAVA_HOME set");
     }
     const std::string javaHome = optJavaHome.value();
-    const std::string javaBin = javaHome + R"(\bin\javaw.exe)";
+    const std::string javaBin = javaHome + R"(\bin\java.exe)";
     const std::string workingDir = arguments.at(0);
 
     std::cout << "SID: " << SidToString(sid) << std::endl;
@@ -142,8 +142,10 @@ int run(int argc, char* argv[]) {
         throw std::runtime_error("CreatePipe: " + GetLastError());
     }
 
-    auto guard_Pipe = std::make_unique<scope_guard>([&]() {
+    auto guard_readPipe = std::make_unique<scope_guard>([&]() {
         CloseHandle(readPipe);
+    });
+    auto guard_writePipe = std::make_unique<scope_guard>([&]() {
         CloseHandle(writePipe);
     });
 
@@ -179,9 +181,10 @@ int run(int argc, char* argv[]) {
         throw std::runtime_error("CreateProcessA: " + GetLastError());
     }
 
+    guard_writePipe.reset();
     std::thread readThread(ReadPipe, readPipe);
     ::WaitForSingleObject(processInfo->hProcess, INFINITE);
-    guard_Pipe.reset();
+    guard_readPipe.reset();
     readThread.join();
 
     DWORD exit_code;
@@ -204,7 +207,6 @@ void ReadPipe(HANDLE pipe) {
         std::cout << buffer;
     }
 }
-
 
 void GrantAccess(PSID sid, std::string objectName,
     SE_OBJECT_TYPE objectType, DWORD accessPermissions) {
@@ -292,7 +294,7 @@ std::string GetProcessArgs(const std::vector<std::string>& vec) {
     std::string result;
     // Start from the second entry
     for (size_t i = 1; i < vec.size(); ++i) {
-        result += vec[i] + " ";
+        result += " " + vec[i];
     }
     return result;
 }
