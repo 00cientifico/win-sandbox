@@ -19,6 +19,7 @@ void GrantAccess(PSID sid, std::string objectName,
 std::string SidToString(PSID sid);
 std::optional<std::string> EnvVar(const std::string& key);
 std::string GetProcessArgs(const std::vector<std::string>& vec);
+void ReadPipe(HANDLE pipe);
 
 // Taken from: https://stackoverflow.com/a/28413370
 class scope_guard {
@@ -37,10 +38,6 @@ public:
 
     ~scope_guard() {
         if (f) f(); // must not throw
-    }
-
-    void dismiss() noexcept {
-        f = nullptr;
     }
 
     scope_guard(const scope_guard&) = delete;
@@ -71,10 +68,11 @@ int run(int argc, char* argv[]) {
         result = ::DeriveAppContainerSidFromAppContainerName(CONTAINER_NAME, &sid);
 
         if (!SUCCEEDED(result)) {
-            throw std::runtime_error("DeriveAppContainerSidFromAppContainerName: " 
+            throw std::runtime_error("DeriveAppContainerSidFromAppContainerName: "
                 + HRESULT_CODE(result));
         }
-    } else if (!SUCCEEDED(result)) {
+    }
+    else if (!SUCCEEDED(result)) {
         throw std::runtime_error("CreateAppContainerProfile: " + HRESULT_CODE(result));
     }
 
@@ -86,9 +84,9 @@ int run(int argc, char* argv[]) {
     if (!optJavaHome) {
         throw std::runtime_error("No JAVA_HOME set");
     }
-    const auto javaHome = optJavaHome.value();
-    const auto javaBin = javaHome + R"(\bin\javaw.exe)";
-    const auto workingDir = arguments.at(0);
+    const std::string javaHome = optJavaHome.value();
+    const std::string javaBin = javaHome + R"(\bin\javaw.exe)";
+    const std::string workingDir = arguments.at(0);
 
     std::cout << "SID: " << SidToString(sid) << std::endl;
     std::cout << "JAVA_HOME: " << javaHome << std::endl;
@@ -98,7 +96,7 @@ int run(int argc, char* argv[]) {
     GrantAccess(sid, javaHome, SE_FILE_OBJECT, FILE_EXECUTE | STANDARD_RIGHTS_READ);
     // Allow read + write for the working dir.
     GrantAccess(sid, workingDir, SE_FILE_OBJECT, FILE_ALL_ACCESS);
-    
+
     SIZE_T attributeSize = 0;
     ::InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
     std::vector<uint8_t> buffer(attributeSize);
@@ -138,49 +136,93 @@ int run(int argc, char* argv[]) {
     securityAttributes->lpSecurityDescriptor = nullptr;
     securityAttributes->bInheritHandle = TRUE;
 
-    HANDLE logHandle = CreateFileA(
-        (workingDir + R"(\log.txt)").c_str(),
-        FILE_APPEND_DATA,
-        FILE_SHARE_WRITE | FILE_SHARE_READ,
-        securityAttributes.get(),
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    scope_guard guard_logHandle = [&]() {
-        CloseHandle(logHandle);
-    };
+    HANDLE readPipe = NULL;
+    HANDLE writePipe = NULL;
+    if (!::CreatePipe(&readPipe, &writePipe, securityAttributes.get(), 0)) {
+        throw std::runtime_error("CreatePipe: " + GetLastError());
+    }
 
-    startupInfo->StartupInfo.hStdError = logHandle;
-    startupInfo->StartupInfo.hStdOutput = logHandle;
+    auto guard_Pipe = std::make_unique<scope_guard>([&]() {
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+    });
+
+    if (!::SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+        throw std::runtime_error("SetHandleInformation: " + GetLastError());
+    }
+
+    startupInfo->StartupInfo.hStdError = writePipe;
+    startupInfo->StartupInfo.hStdOutput = writePipe;
     startupInfo->StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
     auto processInfo = std::make_unique<PROCESS_INFORMATION>();
+    
     scope_guard guard_processInfo = [&]() {
-        CloseHandle(processInfo->hProcess);
-        CloseHandle(processInfo->hThread);
+        ::CloseHandle(processInfo->hProcess);
+        ::CloseHandle(processInfo->hThread);
     };
 
-    if (!CreateProcessA(
+    std::string processArgs = GetProcessArgs(arguments);
+    std::cout << javaBin << " " << processArgs << std::endl;
+
+    if (!::CreateProcessA(
         javaBin.c_str(),
-        const_cast<LPSTR>(GetProcessArgs(arguments).c_str()),
+        const_cast<LPSTR>(processArgs.c_str()),
         nullptr,
         nullptr,
-        false, 
+        true,
         EXTENDED_STARTUPINFO_PRESENT,
-        nullptr, 
+        nullptr,
         workingDir.c_str(),
         (LPSTARTUPINFOA)startupInfo.get(),
         processInfo.get())) {
         throw std::runtime_error("CreateProcessA: " + GetLastError());
     }
 
-    // TOOD wait for process to exit.
-    return 0;
+    std::thread readThread(ReadPipe, readPipe);
+    ::WaitForSingleObject(processInfo->hProcess, INFINITE);
+    guard_Pipe.reset();
+    readThread.join();
+
+    DWORD exit_code;
+    GetExitCodeProcess(processInfo->hProcess, &exit_code);
+    return exit_code;
 }
 
- 
+const int bufferSize = 4096;
+
+void ReadPipe(HANDLE pipe) {
+    DWORD bytesRead = 0;
+    CHAR buffer[bufferSize];
+
+    while (true) {
+        if (!::ReadFile(pipe, buffer, bufferSize - 1, &bytesRead, nullptr) || bytesRead == 0) {
+            break;
+        }
+
+        buffer[bytesRead] = '\0';
+        std::cout << buffer;
+    }
+}
+
+
 void GrantAccess(PSID sid, std::string objectName,
     SE_OBJECT_TYPE objectType, DWORD accessPermissions) {
+    auto originalAcl = std::make_unique<PACL>();
+    DWORD status = ::GetNamedSecurityInfoA(
+        objectName.c_str(),
+        objectType,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        originalAcl.get(),
+        nullptr,
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        throw std::runtime_error(std::format("GetNamedSecurityInfoA: {} : {}",
+            objectName, status));
+    }
+
     auto explicitAccess = std::make_unique<EXPLICIT_ACCESS_A>();
     explicitAccess->grfAccessMode = GRANT_ACCESS;
     explicitAccess->grfAccessPermissions = accessPermissions;
@@ -191,21 +233,6 @@ void GrantAccess(PSID sid, std::string objectName,
     explicitAccess->Trustee.ptstrName = (CHAR*)sid;
     explicitAccess->Trustee.TrusteeForm = TRUSTEE_IS_SID;
     explicitAccess->Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-
-    auto originalAcl = std::make_unique<PACL>();
-    DWORD status = ::GetNamedSecurityInfoA(
-        objectName.c_str(),
-        objectType,
-        DACL_SECURITY_INFORMATION,
-        nullptr, 
-        nullptr,
-        originalAcl.get(),
-        nullptr,
-        nullptr);
-    if (status != ERROR_SUCCESS) {
-        throw std::runtime_error(std::format("GetNamedSecurityInfoA: {} : {}",
-            objectName, status));
-    }
 
     auto newAcl = std::make_unique<PACL>();
     status = ::SetEntriesInAclA(
